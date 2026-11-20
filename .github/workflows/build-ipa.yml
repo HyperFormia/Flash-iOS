@@ -1,0 +1,76 @@
+name: Build Unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          XCODE_PATH=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
+          echo "Using Xcode at: $XCODE_PATH"
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+
+      - name: Generate Xcode project if needed
+        run: |
+          if [ -f "FlashMoE-iOS/project.yml" ] && [ ! -d "FlashMoE-iOS/FlashMoE-iOS.xcodeproj" ]; then
+            brew install xcodegen
+            cd FlashMoE-iOS && xcodegen generate
+          fi
+
+      - name: Build unsigned Release .app
+        run: |
+          PROJ_PATH=$(find . -maxdepth 3 -name "*.xcodeproj" | head -n 1)
+          if [ -z "$PROJ_PATH" ]; then
+            echo "Error: No .xcodeproj found"
+            exit 1
+          fi
+          echo "Found project: $PROJ_PATH"
+
+          SCHEME=$(xcodebuild -list -json -project "$PROJ_PATH" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['project']['schemes'][0])")
+          echo "Building scheme: $SCHEME"
+
+          xcodebuild build \
+            -project "$PROJ_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+      - name: Package .app into FlashMoE-iOS.ipa
+        run: |
+          APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "Error: Built .app bundle not found"
+            exit 1
+          fi
+          echo "Packaging: $APP_PATH"
+          ls -la "$APP_PATH"
+
+          mkdir -p Payload
+          cp -r "$APP_PATH" Payload/
+          zip -qry FlashMoE-iOS.ipa Payload
+          rm -rf Payload
+          ls -lh FlashMoE-iOS.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlashMoE-iOS-ipa
+          path: FlashMoE-iOS.ipa
+          retention-days: 14
