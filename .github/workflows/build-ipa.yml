@@ -1,4 +1,4 @@
-name: Build Unsigned iOS IPA
+name: Build iOS IPA (SideStore / LiveContainer)
 
 on:
   workflow_dispatch:
@@ -13,64 +13,197 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Select latest Xcode
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Print toolchain info
         run: |
-          XCODE_PATH=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
-          echo "Using Xcode at: $XCODE_PATH"
-          sudo xcode-select -s "$XCODE_PATH"
           xcodebuild -version
+          xcodebuild -showsdks
 
-      - name: Generate Xcode project if needed
+      - name: Locate or generate Xcode project
         run: |
-          if [ -f "FlashMoE-iOS/project.yml" ] && [ ! -d "FlashMoE-iOS/FlashMoE-iOS.xcodeproj" ]; then
-            brew install xcodegen
-            cd FlashMoE-iOS && xcodegen generate
-          fi
+          set -euo pipefail
+          PROJ_PATH=$(find "$GITHUB_WORKSPACE" -maxdepth 3 -name "*.xcodeproj" -not -path "*/.*" | head -n 1 || true)
 
-      - name: Build unsigned Release .app
-        run: |
-          PROJ_PATH=$(find . -maxdepth 3 -name "*.xcodeproj" | head -n 1)
           if [ -z "$PROJ_PATH" ]; then
-            echo "Error: No .xcodeproj found"
+            YML_PATH=$(find "$GITHUB_WORKSPACE" -maxdepth 3 -name "project.yml" -not -path "*/.*" | head -n 1 || true)
+            if [ -n "$YML_PATH" ]; then
+              echo "Generating project from $YML_PATH using XcodeGen..."
+              brew install xcodegen
+              (cd "$(dirname "$YML_PATH")" && xcodegen generate)
+              PROJ_PATH=$(find "$GITHUB_WORKSPACE" -maxdepth 3 -name "*.xcodeproj" -not -path "*/.*" | head -n 1 || true)
+            fi
+          fi
+
+          if [ -z "$PROJ_PATH" ]; then
+            echo "Error: Could not find or generate any .xcodeproj file."
+            find "$GITHUB_WORKSPACE" -maxdepth 3 -not -path "*/.git/*"
             exit 1
           fi
-          echo "Found project: $PROJ_PATH"
 
-          SCHEME=$(xcodebuild -list -json -project "$PROJ_PATH" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['project']['schemes'][0])")
-          echo "Building scheme: $SCHEME"
+          echo "Using Xcode project: $PROJ_PATH"
+          echo "PROJ_PATH=$PROJ_PATH" >> "$GITHUB_ENV"
 
-          xcodebuild build \
-            -project "$PROJ_PATH" \
-            -scheme "$SCHEME" \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination "generic/platform=iOS" \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES \
-            COMPILER_INDEX_STORE_ENABLE=NO
-
-      - name: Package .app into FlashMoE-iOS.ipa
+      - name: Build iOS .app (unsigned)
         run: |
-          APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          set -euo pipefail
+          xcodebuild -list -json -project "$PROJ_PATH" > "$RUNNER_TEMP/xcode_list.json"
+          cat "$RUNNER_TEMP/xcode_list.json"
+
+          BUILD_SPEC=$(python3 - "$RUNNER_TEMP/xcode_list.json" <<'PY'
+          import json, sys
+
+          with open(sys.argv[1]) as f:
+              data = json.load(f)
+
+          proj = data.get("project", {})
+          schemes = proj.get("schemes", []) or []
+          targets = proj.get("targets", []) or []
+
+          def pick(items):
+              filtered = [
+                  x for x in items
+                  if not any(bad in x.lower() for bad in ("test", "macos", "mac"))
+              ]
+              pool = filtered if filtered else items
+              for x in pool:
+                  if "ios" in x.lower():
+                      return x
+              for x in pool:
+                  if "flash" in x.lower():
+                      return x
+              return pool[0] if pool else ""
+
+          scheme = pick(schemes)
+          if scheme:
+              print(f"SCHEME={scheme}")
+          else:
+              target = pick(targets)
+              if not target:
+                  sys.exit("Error: No schemes or targets found in Xcode project.")
+              print(f"TARGET={target}")
+          PY
+          )
+
+          MODE="${BUILD_SPEC%%=*}"
+          NAME="${BUILD_SPEC#*=}"
+          echo "Selected build mode: $MODE = $NAME"
+
+          cd "$(dirname "$PROJ_PATH")"
+
+          if [ "$MODE" = "SCHEME" ]; then
+            xcodebuild build \
+              -project "$PROJ_PATH" \
+              -scheme "$NAME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination "generic/platform=iOS" \
+              -derivedDataPath "$GITHUB_WORKSPACE/build" \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              CODE_SIGN_STYLE=Manual \
+              DEVELOPMENT_TEAM="" \
+              PROVISIONING_PROFILE_SPECIFIER="" \
+              PROVISIONING_PROFILE="" \
+              ARCHS=arm64 \
+              ONLY_ACTIVE_ARCH=NO \
+              COMPILER_INDEX_STORE_ENABLE=NO
+          else
+            xcodebuild build \
+              -project "$PROJ_PATH" \
+              -target "$NAME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -derivedDataPath "$GITHUB_WORKSPACE/build" \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              CODE_SIGN_STYLE=Manual \
+              DEVELOPMENT_TEAM="" \
+              PROVISIONING_PROFILE_SPECIFIER="" \
+              PROVISIONING_PROFILE="" \
+              ARCHS=arm64 \
+              ONLY_ACTIVE_ARCH=NO \
+              COMPILER_INDEX_STORE_ENABLE=NO
+          fi
+
+      - name: Ad-hoc sign with entitlements and package .ipa
+        run: |
+          set -euo pipefail
+          APP_PATH=$(find "$GITHUB_WORKSPACE/build/Build/Products" -maxdepth 3 -type d -name "*.app" ! -name "*Tests*.app" | head -n 1 || true)
+
           if [ -z "$APP_PATH" ]; then
-            echo "Error: Built .app bundle not found"
+            echo "Error: Built .app bundle not found. Build output:"
+            find "$GITHUB_WORKSPACE/build" -maxdepth 4 || true
             exit 1
           fi
-          echo "Packaging: $APP_PATH"
-          ls -la "$APP_PATH"
+          echo "Found built app: $APP_PATH"
 
-          mkdir -p Payload
-          cp -r "$APP_PATH" Payload/
-          zip -qry FlashMoE-iOS.ipa Payload
-          rm -rf Payload
-          ls -lh FlashMoE-iOS.ipa
+          # Clean any stale signatures or profiles
+          rm -rf "$APP_PATH/_CodeSignature" "$APP_PATH/embedded.mobileprovision"
+
+          # Find the iOS entitlements file (prioritizing increased-memory-limit)
+          PROJ_DIR=$(dirname "$PROJ_PATH")
+          ENTITLEMENTS_FILE=$(grep -ril "increased-memory-limit" "$PROJ_DIR" --include="*.entitlements" 2>/dev/null | head -n 1 || true)
+          if [ -z "$ENTITLEMENTS_FILE" ]; then
+            ENTITLEMENTS_FILE=$(find "$PROJ_DIR" -maxdepth 3 -name "*.entitlements" ! -iname "*mac*" | head -n 1 || true)
+          fi
+
+          if [ -z "$ENTITLEMENTS_FILE" ]; then
+            ENTITLEMENTS_FILE="$RUNNER_TEMP/fallback.entitlements"
+            cat > "$ENTITLEMENTS_FILE" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.developer.kernel.increased-memory-limit</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+            echo "No iOS .entitlements found in repo; using fallback entitlements."
+          else
+            echo "Using repository entitlements: $ENTITLEMENTS_FILE"
+          fi
+          cat "$ENTITLEMENTS_FILE"
+
+          # Ad-hoc sign any embedded frameworks/dylibs first (prevents SideStore/ldid crashes)
+          if [ -d "$APP_PATH/Frameworks" ]; then
+            find "$APP_PATH/Frameworks" -maxdepth 2 \( -name "*.framework" -o -name "*.dylib" \) | while IFS= read -r fw; do
+              rm -rf "$fw/_CodeSignature" "$fw/embedded.mobileprovision"
+              codesign --force --sign - "$fw"
+            done
+          fi
+
+          # Ad-hoc sign main .app with entitlements so SideStore/LiveContainer reads them
+          codesign --force --sign - --entitlements "$ENTITLEMENTS_FILE" "$APP_PATH"
+
+          echo "Verifying embedded Mach-O entitlements:"
+          codesign -d --entitlements :- "$APP_PATH" || true
+
+          # Package into standard Payload/*.app IPA structure
+          rm -rf "$RUNNER_TEMP/ipa_stage"
+          mkdir -p "$RUNNER_TEMP/ipa_stage/Payload"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/ipa_stage/Payload/"
+          (cd "$RUNNER_TEMP/ipa_stage" && zip -qry "$GITHUB_WORKSPACE/FlashMoE-iOS.ipa" Payload)
+
+          # Sanity-check the generated IPA before uploading
+          ls -lh "$GITHUB_WORKSPACE/FlashMoE-iOS.ipa"
+          if ! unzip -l "$GITHUB_WORKSPACE/FlashMoE-iOS.ipa" | grep -q "Payload/.*\.app/Info\.plist"; then
+            echo "Error: Packaged IPA is missing Info.plist!"
+            exit 1
+          fi
+          echo "Metal shaders & plist inside IPA:"
+          unzip -l "$GITHUB_WORKSPACE/FlashMoE-iOS.ipa" | grep -E "Info\.plist|metallib" || true
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: FlashMoE-iOS-ipa
           path: FlashMoE-iOS.ipa
+          if-no-files-found: error
           retention-days: 14
